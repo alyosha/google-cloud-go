@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"cloud.google.com/go/iam"
-	"cloud.google.com/go/internal/optional"
+	"github.com/alyosha/google-cloud-go/iam"
+	"github.com/alyosha/google-cloud-go/internal/optional"
 	"github.com/golang/protobuf/ptypes"
 	durpb "github.com/golang/protobuf/ptypes/duration"
 	gax "github.com/googleapis/gax-go/v2"

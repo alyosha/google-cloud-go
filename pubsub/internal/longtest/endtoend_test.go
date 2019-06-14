@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	"cloud.google.com/go/internal/testutil"
-	"cloud.google.com/go/pubsub"
+	"github.com/alyosha/google-cloud-go/internal/testutil"
+	"github.com/alyosha/google-cloud-go/pubsub"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
