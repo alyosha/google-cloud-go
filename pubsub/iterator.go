@@ -149,6 +149,7 @@ func (it *messageIterator) delay(ackID string, delay time.Duration) {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 	delete(it.keepAliveDeadlines, ackID)
+	delay = it.delayDuration(delay)
 	it.pendingDelays[delay] = append(it.pendingDelays[delay], ackID)
 	it.checkDrained()
 }
@@ -554,4 +555,14 @@ func (it *messageIterator) ackDeadline() time.Duration {
 		return minAckDeadline
 	}
 	return pt
+}
+
+func (it *messageIterator) delayDuration(delay time.Duration) time.Duration {
+	if delay > maxAckDeadline {
+		return maxAckDeadline
+	}
+	if delay < minAckDeadline {
+		return minAckDeadline
+	}
+	return delay
 }
