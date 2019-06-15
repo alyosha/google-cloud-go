@@ -46,13 +46,22 @@ type Message struct {
 	// receiveTime is the time the message was received by the client.
 	receiveTime time.Time
 
+	// retry delay is the duration requested by the client for next redelivery.
+	// The maximum duration which can be specified is capped at 10m
+	retryDelay time.Duration
+
 	// size is the approximate size of the message's data and attributes.
 	size int
 
 	calledDone bool
 
+	calledDelay bool
+
 	// The done method of the iterator that created this Message.
 	doneFunc func(string, bool, time.Time)
+
+	// The delay method of the iterator that created this Message.
+	delayFunc func(string, time.Duration)
 }
 
 func toMessage(resp *pb.ReceivedMessage) (*Message, error) {
@@ -91,10 +100,34 @@ func (m *Message) Nack() {
 	m.done(false)
 }
 
+// Delay configures a retry delay duration which, upon callback from subscriber,
+// will cause the message to be released from flow control and to have its
+// ackDeadline modified to the current time + specified retry delay
+func (m *Message) Delay(delay time.Duration) {
+	m.retryDelay = delay
+}
+
 func (m *Message) done(ack bool) {
 	if m.calledDone {
 		return
 	}
 	m.calledDone = true
 	m.doneFunc(m.ackID, ack, m.receiveTime)
+}
+
+func (m *Message) delay() {
+	if m.calledDelay {
+		return
+	}
+	m.calledDelay = true
+	m.delayFunc(m.ackID, m.retryDelay)
+}
+
+func (m *Message) retry(fc *flowController) {
+	// Don't do anything if retry delay is not set
+	if m.retryDelay == time.Duration(0) {
+		return
+	}
+	m.delay()
+	fc.release(len(m.Data))
 }

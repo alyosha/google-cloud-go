@@ -630,6 +630,7 @@ func (s *Subscription) receive(ctx context.Context, po *pullOptions, fc *flowCon
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				defer msg.retry(fc)
 				f(ctx2, msg)
 			}()
 		}
