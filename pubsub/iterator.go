@@ -430,100 +430,14 @@ func (it *messageIterator) sendModAck(m map[string]bool, deadline time.Duration)
 		} else {
 			recordStat(it.ctx, ModAckCount, int64(len(ids)))
 		}
-		addModAcks(ids, int32(deadline/time.Second))
-		// Retry this RPC on Unavailable for a short amount of time, then give up
-		// without returning a fatal error. The utility of this RPC is by nature
-		// transient (since the deadline is relative to the current time) and it
-		// isn't crucial for correctness (since expired messages will just be
-		// resent).
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		bo := gax.Backoff{
-			Initial:    100 * time.Millisecond,
-			Max:        time.Second,
-			Multiplier: 2,
-		}
-		for {
-			err := it.subc.ModifyAckDeadline(cctx, &pb.ModifyAckDeadlineRequest{
-				Subscription:       it.subName,
-				AckDeadlineSeconds: int32(deadline / time.Second),
-				AckIds:             ids,
-			})
-			switch status.Code(err) {
-			case codes.Unavailable:
-				if err := gax.Sleep(cctx, bo.Pause()); err == nil {
-					continue
-				}
-				// Treat sleep timeout like RPC timeout.
-				fallthrough
-			case codes.DeadlineExceeded:
-				// Timeout. Not a fatal error, but note that it happened.
-				recordStat(it.ctx, ModAckTimeoutCount, 1)
-				return nil
-			default:
-				// Any other error is fatal.
-				return err
-			}
-		}
+		return it.sendModAckIDRPC(ids, deadline)
 	})
-}
-
-func (it *messageIterator) sendAckIDRPC(ackIDSet map[string]bool, call func([]string) error) bool {
-	ackIDs := make([]string, 0, len(ackIDSet))
-	for k := range ackIDSet {
-		ackIDs = append(ackIDs, k)
-	}
-	var toSend []string
-	for len(ackIDs) > 0 {
-		toSend, ackIDs = splitRequestIDs(ackIDs, maxPayload)
-		if err := call(toSend); err != nil {
-			// The underlying client handles retries, so any error is fatal to the
-			// iterator.
-			it.fail(err)
-			return false
-		}
-	}
-	return true
 }
 
 func (it *messageIterator) sendDelay(m map[time.Duration][]string) bool {
 	return it.sendDelayIDRPC(m, func(ids []string, deadline time.Duration) error {
 		recordStat(it.ctx, ModAckCount, int64(len(ids)))
-		addModAcks(ids, int32(deadline/time.Second))
-		// Retry this RPC on Unavailable for a short amount of time, then give up
-		// without returning a fatal error. The utility of this RPC is by nature
-		// transient (since the deadline is relative to the current time) and it
-		// isn't crucial for correctness (since expired messages will just be
-		// resent).
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		bo := gax.Backoff{
-			Initial:    100 * time.Millisecond,
-			Max:        time.Second,
-			Multiplier: 2,
-		}
-		for {
-			err := it.subc.ModifyAckDeadline(cctx, &pb.ModifyAckDeadlineRequest{
-				Subscription:       it.subName,
-				AckDeadlineSeconds: int32(deadline / time.Second),
-				AckIds:             ids,
-			})
-			switch status.Code(err) {
-			case codes.Unavailable:
-				if err := gax.Sleep(cctx, bo.Pause()); err == nil {
-					continue
-				}
-				// Treat sleep timeout like RPC timeout.
-				fallthrough
-			case codes.DeadlineExceeded:
-				// Timeout. Not a fatal error, but note that it happened.
-				recordStat(it.ctx, ModAckTimeoutCount, 1)
-				return nil
-			default:
-				// Any other error is fatal.
-				return err
-			}
-		}
+		return it.sendModAckIDRPC(ids, deadline)
 	})
 }
 
@@ -539,6 +453,62 @@ func (it *messageIterator) sendDelayIDRPC(delayIDSet map[time.Duration][]string,
 				it.fail(err)
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func (it *messageIterator) sendModAckIDRPC(ids []string, deadline time.Duration) error {
+	addModAcks(ids, int32(deadline/time.Second))
+	// Retry this RPC on Unavailable for a short amount of time, then give up
+	// without returning a fatal error. The utility of this RPC is by nature
+	// transient (since the deadline is relative to the current time) and it
+	// isn't crucial for correctness (since expired messages will just be
+	// resent).
+	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	bo := gax.Backoff{
+		Initial:    100 * time.Millisecond,
+		Max:        time.Second,
+		Multiplier: 2,
+	}
+	for {
+		err := it.subc.ModifyAckDeadline(cctx, &pb.ModifyAckDeadlineRequest{
+			Subscription:       it.subName,
+			AckDeadlineSeconds: int32(deadline / time.Second),
+			AckIds:             ids,
+		})
+		switch status.Code(err) {
+		case codes.Unavailable:
+			if err := gax.Sleep(cctx, bo.Pause()); err == nil {
+				continue
+			}
+			// Treat sleep timeout like RPC timeout.
+			fallthrough
+		case codes.DeadlineExceeded:
+			// Timeout. Not a fatal error, but note that it happened.
+			recordStat(it.ctx, ModAckTimeoutCount, 1)
+			return nil
+		default:
+			// Any other error is fatal.
+			return err
+		}
+	}
+}
+
+func (it *messageIterator) sendAckIDRPC(ackIDSet map[string]bool, call func([]string) error) bool {
+	ackIDs := make([]string, 0, len(ackIDSet))
+	for k := range ackIDSet {
+		ackIDs = append(ackIDs, k)
+	}
+	var toSend []string
+	for len(ackIDs) > 0 {
+		toSend, ackIDs = splitRequestIDs(ackIDs, maxPayload)
+		if err := call(toSend); err != nil {
+			// The underlying client handles retries, so any error is fatal to the
+			// iterator.
+			it.fail(err)
+			return false
 		}
 	}
 	return true
