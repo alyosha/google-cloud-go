@@ -36,19 +36,20 @@ import (
 const gracePeriod = 5 * time.Second
 
 type messageIterator struct {
-	ctx        context.Context
-	cancel     func() // the function that will cancel ctx; called in stop
-	po         *pullOptions
-	ps         *pullStream
-	subc       *vkit.SubscriberClient
-	subName    string
-	kaTick     <-chan time.Time // keep-alive (deadline extensions)
-	ackTicker  *time.Ticker     // message acks
-	nackTicker *time.Ticker     // message nacks (more frequent than acks)
-	pingTicker *time.Ticker     //  sends to the stream to keep it open
-	failed     chan struct{}    // closed on stream error
-	drained    chan struct{}    // closed when stopped && no more pending messages
-	wg         sync.WaitGroup
+	ctx         context.Context
+	cancel      func() // the function that will cancel ctx; called in stop
+	po          *pullOptions
+	ps          *pullStream
+	subc        *vkit.SubscriberClient
+	subName     string
+	kaTick      <-chan time.Time // keep-alive (deadline extensions)
+	ackTicker   *time.Ticker     // message acks
+	nackTicker  *time.Ticker     // message nacks (more frequent than acks)
+	delayTicker *time.Ticker     // message delays
+	pingTicker  *time.Ticker     //  sends to the stream to keep it open
+	failed      chan struct{}    // closed on stream error
+	drained     chan struct{}    // closed when stopped && no more pending messages
+	wg          sync.WaitGroup
 
 	mu          sync.Mutex
 	ackTimeDist *distribution.D // dist uses seconds
@@ -62,6 +63,7 @@ type messageIterator struct {
 	keepAliveDeadlines map[string]time.Time
 	pendingAcks        map[string]bool
 	pendingNacks       map[string]bool
+	pendingDelays      map[time.Duration][]string
 	pendingModAcks     map[string]bool // ack IDs whose ack deadline is to be modified
 	err                error           // error from stream failure
 }
@@ -82,6 +84,7 @@ func newMessageIterator(subc *vkit.SubscriberClient, subName string, po *pullOpt
 	// Ack promptly so users don't lose work if client crashes.
 	ackTicker := time.NewTicker(100 * time.Millisecond)
 	nackTicker := time.NewTicker(100 * time.Millisecond)
+	delayTicker := time.NewTicker(100 * time.Millisecond)
 	pingTicker := time.NewTicker(30 * time.Second)
 	cctx, cancel := context.WithCancel(context.Background())
 	it := &messageIterator{
@@ -94,6 +97,7 @@ func newMessageIterator(subc *vkit.SubscriberClient, subName string, po *pullOpt
 		kaTick:             time.After(keepAlivePeriod),
 		ackTicker:          ackTicker,
 		nackTicker:         nackTicker,
+		delayTicker:        delayTicker,
 		pingTicker:         pingTicker,
 		failed:             make(chan struct{}),
 		drained:            make(chan struct{}),
@@ -101,6 +105,7 @@ func newMessageIterator(subc *vkit.SubscriberClient, subName string, po *pullOpt
 		keepAliveDeadlines: map[string]time.Time{},
 		pendingAcks:        map[string]bool{},
 		pendingNacks:       map[string]bool{},
+		pendingDelays:      map[time.Duration][]string{},
 		pendingModAcks:     map[string]bool{},
 	}
 	it.wg.Add(1)
@@ -137,6 +142,16 @@ func (it *messageIterator) checkDrained() {
 		}
 	default:
 	}
+}
+
+// Called when a message's retry is delayed
+func (it *messageIterator) delay(ackID string, delay time.Duration) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	delete(it.keepAliveDeadlines, ackID)
+	delay = it.delayDuration(delay)
+	it.pendingDelays[delay] = append(it.pendingDelays[delay], ackID)
+	it.checkDrained()
 }
 
 // Called when a message is acked/nacked.
@@ -210,6 +225,7 @@ func (it *messageIterator) receive(maxToPull int32) ([]*Message, error) {
 		m.receiveTime = now
 		addRecv(m.ID, m.ackID, now)
 		m.doneFunc = it.done
+		m.delayFunc = it.delay
 		it.keepAliveDeadlines[m.ackID] = maxExt
 		// Don't change the mod-ack if the message is going to be nacked. This is
 		// possible if there are retries.
@@ -259,6 +275,7 @@ func (it *messageIterator) sender() {
 	defer it.wg.Done()
 	defer it.ackTicker.Stop()
 	defer it.nackTicker.Stop()
+	defer it.delayTicker.Stop()
 	defer it.pingTicker.Stop()
 	defer func() {
 		if it.ps != nil {
@@ -270,6 +287,7 @@ func (it *messageIterator) sender() {
 	for !done {
 		sendAcks := false
 		sendNacks := false
+		sendDelays := false
 		sendModAcks := false
 		sendPing := false
 
@@ -286,6 +304,7 @@ func (it *messageIterator) sender() {
 			it.mu.Lock()
 			sendAcks = (len(it.pendingAcks) > 0)
 			sendNacks = (len(it.pendingNacks) > 0)
+			sendDelays = (len(it.pendingDelays) > 0)
 			// No point in sending modacks.
 			done = true
 
@@ -302,6 +321,10 @@ func (it *messageIterator) sender() {
 			}
 			it.kaTick = time.After(nextTick)
 
+		case <-it.delayTicker.C:
+			it.mu.Lock()
+			sendDelays = (len(it.pendingDelays) > 0)
+
 		case <-it.nackTicker.C:
 			it.mu.Lock()
 			sendNacks = (len(it.pendingNacks) > 0)
@@ -317,6 +340,7 @@ func (it *messageIterator) sender() {
 		}
 		// Lock is held here.
 		var acks, nacks, modAcks map[string]bool
+		var delays map[time.Duration][]string
 		if sendAcks {
 			acks = it.pendingAcks
 			it.pendingAcks = map[string]bool{}
@@ -324,6 +348,10 @@ func (it *messageIterator) sender() {
 		if sendNacks {
 			nacks = it.pendingNacks
 			it.pendingNacks = map[string]bool{}
+		}
+		if sendDelays {
+			delays = it.pendingDelays
+			it.pendingDelays = map[time.Duration][]string{}
 		}
 		if sendModAcks {
 			modAcks = it.pendingModAcks
@@ -339,6 +367,11 @@ func (it *messageIterator) sender() {
 		if sendNacks {
 			// Nack indicated by modifying the deadline to zero.
 			if !it.sendModAck(nacks, 0) {
+				return
+			}
+		}
+		if sendDelays {
+			if !it.sendDelay(delays) {
 				return
 			}
 		}
@@ -398,42 +431,70 @@ func (it *messageIterator) sendModAck(m map[string]bool, deadline time.Duration)
 		} else {
 			recordStat(it.ctx, ModAckCount, int64(len(ids)))
 		}
-		addModAcks(ids, int32(deadline/time.Second))
-		// Retry this RPC on Unavailable for a short amount of time, then give up
-		// without returning a fatal error. The utility of this RPC is by nature
-		// transient (since the deadline is relative to the current time) and it
-		// isn't crucial for correctness (since expired messages will just be
-		// resent).
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		bo := gax.Backoff{
-			Initial:    100 * time.Millisecond,
-			Max:        time.Second,
-			Multiplier: 2,
-		}
-		for {
-			err := it.subc.ModifyAckDeadline(cctx, &pb.ModifyAckDeadlineRequest{
-				Subscription:       it.subName,
-				AckDeadlineSeconds: int32(deadline / time.Second),
-				AckIds:             ids,
-			})
-			switch status.Code(err) {
-			case codes.Unavailable:
-				if err := gax.Sleep(cctx, bo.Pause()); err == nil {
-					continue
-				}
-				// Treat sleep timeout like RPC timeout.
-				fallthrough
-			case codes.DeadlineExceeded:
-				// Timeout. Not a fatal error, but note that it happened.
-				recordStat(it.ctx, ModAckTimeoutCount, 1)
-				return nil
-			default:
-				// Any other error is fatal.
-				return err
+		return it.sendModAckIDRPC(ids, deadline)
+	})
+}
+
+func (it *messageIterator) sendDelay(m map[time.Duration][]string) bool {
+	return it.sendDelayIDRPC(m, func(ids []string, deadline time.Duration) error {
+		recordStat(it.ctx, ModAckCount, int64(len(ids)))
+		return it.sendModAckIDRPC(ids, deadline)
+	})
+}
+
+func (it *messageIterator) sendDelayIDRPC(delayIDSet map[time.Duration][]string, call func([]string, time.Duration) error) bool {
+	for k, v := range delayIDSet {
+		delayIDs := v
+		var toSend []string
+		for len(delayIDs) > 0 {
+			toSend, delayIDs = splitRequestIDs(delayIDs, maxPayload)
+			if err := call(toSend, k); err != nil {
+				// The underlying client handles retries, so any error is fatal to the
+				// iterator.
+				it.fail(err)
+				return false
 			}
 		}
-	})
+	}
+	return true
+}
+
+func (it *messageIterator) sendModAckIDRPC(ids []string, deadline time.Duration) error {
+	addModAcks(ids, int32(deadline/time.Second))
+	// Retry this RPC on Unavailable for a short amount of time, then give up
+	// without returning a fatal error. The utility of this RPC is by nature
+	// transient (since the deadline is relative to the current time) and it
+	// isn't crucial for correctness (since expired messages will just be
+	// resent).
+	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	bo := gax.Backoff{
+		Initial:    100 * time.Millisecond,
+		Max:        time.Second,
+		Multiplier: 2,
+	}
+	for {
+		err := it.subc.ModifyAckDeadline(cctx, &pb.ModifyAckDeadlineRequest{
+			Subscription:       it.subName,
+			AckDeadlineSeconds: int32(deadline / time.Second),
+			AckIds:             ids,
+		})
+		switch status.Code(err) {
+		case codes.Unavailable:
+			if err := gax.Sleep(cctx, bo.Pause()); err == nil {
+				continue
+			}
+			// Treat sleep timeout like RPC timeout.
+			fallthrough
+		case codes.DeadlineExceeded:
+			// Timeout. Not a fatal error, but note that it happened.
+			recordStat(it.ctx, ModAckTimeoutCount, 1)
+			return nil
+		default:
+			// Any other error is fatal.
+			return err
+		}
+	}
 }
 
 func (it *messageIterator) sendAckIDRPC(ackIDSet map[string]bool, call func([]string) error) bool {
@@ -494,4 +555,14 @@ func (it *messageIterator) ackDeadline() time.Duration {
 		return minAckDeadline
 	}
 	return pt
+}
+
+func (it *messageIterator) delayDuration(delay time.Duration) time.Duration {
+	if delay > maxAckDeadline {
+		return maxAckDeadline
+	}
+	if delay < minAckDeadline {
+		return minAckDeadline
+	}
+	return delay
 }
